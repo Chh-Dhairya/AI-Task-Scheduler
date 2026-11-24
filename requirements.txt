@@ -1,0 +1,18 @@
+# Data Processing & Analysis
+numpy
+pandas
+scikit-learn
+
+# Machine Learning & Deep Learning
+xgboost
+torch>=2.0
+joblib
+
+# Interfaces & Visualization
+streamlit
+plotly
+matplotlib
+scipy
+
+# LLM Frameworks
+google-genai

@@ -1,6 +1,10 @@
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
 
+# Single shared map: time bucket (from get_time_bucket) → representative hour.
+# Import this everywhere; do not keep local copies.
+BUCKET_TO_HOUR = {0: 7, 1: 11, 2: 15, 3: 19, 4: 22}
+
 
 def get_time_bucket(hour):
     if 5 <= hour < 9:    return 0   # early morning

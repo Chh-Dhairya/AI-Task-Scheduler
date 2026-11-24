@@ -23,7 +23,7 @@ from typing import List, Dict, Any
 from duration_model import DurationModel
 from data_loader    import load_dataset
 from preprocess     import DataPreprocessor
-from scheduler      import schedule_tasks
+# schedule_tasks (PPO) is used through ml_pipeline.create_ml_schedule (B8)
 from habit_model    import HabitModel
 from api_scheduler  import APIScheduler
 from fusion_engine  import ScheduleFusionEngine
@@ -32,7 +32,7 @@ from config         import (
 )
 
 # ── constants ─────────────────────────────────────────────────────────────────
-BUCKET_TO_HOUR = {0: 7, 1: 11, 2: 15, 3: 19, 4: 22}
+from preprocess import BUCKET_TO_HOUR   # shared map, single source of truth
 
 DATA_PATH           = "activities_of_daily_living_fixed.csv"
 HABIT_MODEL_PATH    = "habit_model.pkl"
@@ -56,9 +56,9 @@ st.markdown("""
 
 # ── session state ─────────────────────────────────────────────────────────────
 for key in ["tasks", "schedule", "ml_schedule", "api_schedule",
-            "fused_schedule", "models_loaded"]:
+            "fused_schedule", "models_loaded", "unscheduled"]:
     if key not in st.session_state:
-        st.session_state[key] = [] if key in ("tasks",) else None
+        st.session_state[key] = [] if key in ("tasks", "unscheduled") else None
 if st.session_state.models_loaded is None:
     st.session_state.models_loaded = False
 
@@ -87,51 +87,11 @@ def load_models():
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-def create_ml_schedule(tasks: List[Dict], models: Dict) -> List[Dict]:
-    ml_schedule = []
-    for task in tasks:
-        start_time = datetime.now().replace(
-            hour=task["Preferred_Hour"], minute=0, second=0, microsecond=0
-        )
-        end_time = start_time + timedelta(minutes=task["Estimated_Duration"])
-
-        rl_reward             = 0.8
-        habit_alignment       = task.get("Confidence", 0.7)
-        deadline_satisfaction = 1.0 if task["Preferred_Hour"] <= task["Deadline_Hour"] else 0.5
-        priority_score        = task["Priority"] / 4.0
-
-        ml_score = (
-            ML_WEIGHTS["rl_reward"]              * rl_reward             +
-            ML_WEIGHTS["habit_alignment"]         * habit_alignment       +
-            ML_WEIGHTS["deadline_satisfaction"]   * deadline_satisfaction +
-            ML_WEIGHTS["priority_score"]          * priority_score
-        )
-        ml_schedule.append({
-            "task":                 task["Task"],
-            "start_time":           start_time,
-            "end_time":             end_time,
-            "ml_score":             ml_score,
-            "rl_reward":            rl_reward,
-            "habit_alignment":      habit_alignment,
-            "deadline_satisfaction":deadline_satisfaction,
-            "priority_score":       priority_score,
-        })
-    return ml_schedule
-
-
-def prepare_tasks_for_api(tasks: List[Dict]) -> List[Dict]:
-    return [
-        {
-            "name":     t["Task"],
-            "duration": int(t["Estimated_Duration"]),
-            "priority": t["Priority"],
-            "deadline": datetime.now().replace(
-                hour=t["Deadline_Hour"], minute=0, second=0, microsecond=0
-            ),
-        }
-        for t in tasks
-    ]
+# B8: the ML schedule now comes from the PPO scheduler. The functions live in
+# ml_pipeline.py so main.py (CLI) uses exactly the same code.
+from ml_pipeline import (
+    create_ml_schedule, prepare_tasks_for_api, unscheduled_tasks, MAX_TASKS,
+)
 
 
 # ── chart helpers ─────────────────────────────────────────────────────────────
@@ -263,8 +223,13 @@ def main():
                     deadline_hour = st.slider("Deadline Hour", 0, 23, 20,
                                               help="Latest hour to finish this task")
 
-                if st.form_submit_button("➕ Add Task", use_container_width=True):
-                    if task_name in models["preprocessor"].activity_encoder.classes_:
+                if st.form_submit_button("➕ Add Task", width="stretch"):
+                    # B8 limits: tasks are matched by name, and the PPO has 10 slots
+                    if any(t["Task"] == task_name for t in st.session_state.tasks):
+                        st.error(f"❌ {task_name} is already in the list (each activity once).")
+                    elif len(st.session_state.tasks) >= MAX_TASKS:
+                        st.error(f"❌ At most {MAX_TASKS} tasks per day.")
+                    elif task_name in models["preprocessor"].activity_encoder.classes_:
                         activity_encoded = models["preprocessor"].activity_encoder.transform([task_name])[0]
 
                         bucket, confidence = models["habit_model"].predict_with_confidence(
@@ -311,15 +276,15 @@ def main():
                 st.markdown("---")
                 c_clear, c_sched = st.columns(2)
                 with c_clear:
-                    if st.button("🗑️ Clear All", use_container_width=True):
+                    if st.button("🗑️ Clear All", width="stretch"):
                         st.session_state.tasks = []
                         st.rerun()
                 with c_sched:
                     if st.button("🚀 Generate Schedule", type="primary",
-                                 use_container_width=True):
+                                 width="stretch"):
                         with st.spinner("🔄 Creating hybrid schedule..."):
-                            ml_schedule  = create_ml_schedule(st.session_state.tasks, models)
-                            api_tasks    = prepare_tasks_for_api(st.session_state.tasks)
+                            ml_schedule  = create_ml_schedule(st.session_state.tasks)
+                            api_tasks    = prepare_tasks_for_api(st.session_state.tasks, ml_schedule)
                             api_schedule = models["api_scheduler"].get_schedule(api_tasks)
                             avg_conf     = float(np.mean([t.get("Confidence", 0.7)
                                                           for t in st.session_state.tasks]))
@@ -329,6 +294,8 @@ def main():
                             st.session_state.ml_schedule    = ml_schedule
                             st.session_state.api_schedule   = api_schedule
                             st.session_state.fused_schedule = fused
+                            st.session_state.unscheduled    = unscheduled_tasks(
+                                st.session_state.tasks, ml_schedule)
                         st.success("✅ Schedule generated!")
                         st.rerun()
             else:
@@ -337,6 +304,10 @@ def main():
     # ── TAB 2: schedule view ──────────────────────────────────────────────────
     with tab2:
         st.markdown('<p class="sub-header">📅 Your Schedule</p>', unsafe_allow_html=True)
+
+        if st.session_state.unscheduled:   # B8: tasks the PPO could not fit in the day
+            st.warning("⚠️ Could not be scheduled (not enough time before "
+                       f"22:00): {', '.join(st.session_state.unscheduled)}")
 
         if st.session_state.fused_schedule:
             fig = create_timeline_chart(st.session_state.fused_schedule)
@@ -432,7 +403,7 @@ This **Hybrid AI Task Scheduler** combines three layers:
 **🤖 Machine Learning (Primary — 80 % weight)**
 - XGBoost duration prediction (`duration_model.py`)
 - Three-level habit model for time preference (`habit_model.py`)
-- Dueling Double DQN ordering via RL agent (`scheduler.py` + `rl_agent.py`)
+- PPO (Proximal Policy Optimization) ordering via RL agent (`scheduler.py` + `rl_agent.py`)
 - Personalised to your historical activity patterns
 
 **🌐 Gemini API Behavioral Correction (Secondary — 20 % weight)**

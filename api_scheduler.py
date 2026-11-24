@@ -4,7 +4,9 @@ Gemini-based behavioral correction scheduler.
 
 Key fixes vs original
 ─────────────────────
-1. Model updated to "gemini-2.0-flash"  (gemini-1.5-flash is 404 on v1beta)
+1. Model name comes from config.GEMINI_MODEL (env var GEMINI_MODEL);
+   gemini-2.0-flash was shut down on 1 June 2026. Calls use temperature 0
+   and JSON response mode. Every item carries "source": "gemini" | "rules".
 2. API response time strings ("HH:MM") are parsed into real datetime objects
    so fusion_engine.py can do arithmetic on them without crashing.
 3. Graceful fallback: if Gemini is unavailable, _build_fallback_schedule()
@@ -15,19 +17,32 @@ Key fixes vs original
 """
 
 from google import genai
+from google.genai import types
 from datetime import datetime, timedelta
 import json
 import logging
-from config import API_KEY, ACTIVITY_TIME_RULES, UNHEALTHY_PATTERNS
+from config import API_KEY, GEMINI_MODEL, ACTIVITY_TIME_RULES, UNHEALTHY_PATTERNS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialise Gemini client once at import time
-client = genai.Client(api_key=API_KEY)
+# Gemini client is created lazily on first use, so importing this module
+# never fails when GEMINI_API_KEY is unset (the rule fallback is used instead).
+_client = None
 
-# Gemini model to use — update here if you want to switch
-GEMINI_MODEL = "gemini-2.0-flash"
+
+def get_client():
+    global _client
+    if _client is None:
+        if not API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        _client = genai.Client(api_key=API_KEY)
+    return _client
+
+
+def in_window(h, start, end):
+    """True if hour h is inside [start, end), handling windows that cross midnight."""
+    return start <= h < end if start <= end else (h >= start or h < end)
 
 
 class APIScheduler:
@@ -44,8 +59,11 @@ class APIScheduler:
       so the fusion engine is never starved of an API schedule.
     """
 
-    def __init__(self):
+    def __init__(self, temperature: float = 0.0, include_ml_times: bool = True):
         self._today = datetime.now().date()
+        self.temperature = temperature   # 0.0 = deterministic (Ablation 4c uses 0.7)
+        # False = old prompt without ML start times (Ablation 4b, variant P0)
+        self.include_ml_times = include_ml_times
 
     # ── public entry-point ────────────────────────────────────────────────────
 
@@ -68,9 +86,45 @@ class APIScheduler:
         # If Gemini failed or returned nothing, fall back to rule engine
         if not result:
             logger.warning("Gemini unavailable — using built-in rule-based fallback.")
-            result = self._build_fallback_schedule(tasks)
+            return self._build_fallback_schedule(tasks)
 
-        return result
+        return self._reconcile(tasks, result)
+
+    def _reconcile(self, tasks: list, items: list) -> list:
+        """
+        Make Gemini's reply match the request exactly:
+        • keep only items whose name is a requested task (first one per name),
+        • force the requested duration (the prompt forbids changing it),
+        • tasks Gemini left out are corrected by the rule fallback instead.
+        Output is in request order, one item per requested task.
+        """
+        wanted   = {t["name"] for t in tasks}
+        by_name  = {}
+        for it in items:
+            by_name.setdefault(it["task"], it)
+        unknown = [n for n in by_name if n not in wanted]
+        if unknown:
+            logger.warning(f"Gemini returned unknown task names {unknown}; ignored.")
+
+        missing = [t for t in tasks if t["name"] not in by_name]
+        if missing:
+            logger.warning(f"Gemini omitted {[t['name'] for t in missing]}; "
+                           f"using rule fallback for these.")
+        fallback = {f["task"]: f for f in self._build_fallback_schedule(missing)}
+
+        out = []
+        for t in tasks:
+            it = by_name.get(t["name"])
+            if it is None:
+                out.append(fallback[t["name"]])
+                continue
+            dur = timedelta(minutes=int(t.get("duration", 60)))
+            if it["end_time"] - it["start_time"] != dur:
+                logger.warning(f"Gemini changed the duration of {t['name']}; "
+                               f"keeping the requested {dur}.")
+                it["end_time"] = it["start_time"] + dur
+            out.append(it)
+        return out
 
     # ── Gemini API call ───────────────────────────────────────────────────────
 
@@ -81,26 +135,30 @@ class APIScheduler:
             task_lines = []
             for t in tasks:
                 dl = t['deadline'].strftime('%H:%M') if isinstance(t.get('deadline'), datetime) else str(t.get('deadline', '23:00'))
+                ml = f"ML start={t['ml_start'].strftime('%H:%M')}, " if self.include_ml_times else ""
                 task_lines.append(
-                    f"  - {t['name']}: duration={t['duration']} min, "
+                    f"  - {t['name']}: {ml}duration={t['duration']} min, "
                     f"priority={t['priority']}, deadline={dl}"
                 )
             tasks_text = "\n".join(task_lines)
+            keep_rule = ("If a task's ML start time already follows the health rules, keep it unchanged.\n"
+                         if self.include_ml_times else "")
 
             prompt = f"""You are a behavioral correction scheduling AI.
 Your ONLY job is to correct unhealthy timings suggested by an ML model.
 You must NOT reorder tasks or change durations.
-
+{keep_rule}
 Today's date: {self._today}
 
 Tasks to schedule:
 {tasks_text}
 
 Health rules you must enforce:
-- No eating (Breakfast / Lunch / Dinner / Eating) after 22:00
-- No Sleep after 01:00
-- Exercise is best before 10:00; penalise if after 21:00
-- Work / Study should stay within 07:00-22:00
+- Eating and Cooking: 07:00-21:00. Never start Eating between 22:00 and 05:00
+- Sleeping: start between 21:00 and 01:00. Starting between 01:00 and 12:00 is too late; between 12:00 and 20:00 is too early
+- Exercising: best 06:00-10:00. Never start between 21:00 and 05:00
+- Working: 09:00-18:00, and never outside 07:00-22:00
+- Walking: 06:00-20:00. Shopping: 09:00-21:00
 - Prefer morning productivity
 
 Return ONLY a valid JSON array — no markdown, no explanation:
@@ -116,9 +174,13 @@ Return ONLY a valid JSON array — no markdown, no explanation:
 ]
 """
 
-            response = client.models.generate_content(
+            response = get_client().models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=self.temperature,           # 0.0 → same answer every time
+                    response_mime_type="application/json",  # forces valid JSON
+                ),
             )
 
             if not response or not response.text:
@@ -166,6 +228,7 @@ Return ONLY a valid JSON array — no markdown, no explanation:
                     "end_time":   end_dt,
                     "score":      float(item.get("score", 0.7)),
                     "reason":     item.get("reason", "API suggestion"),
+                    "source":     "gemini",
                 })
             except Exception as e:
                 logger.warning(f"Skipping malformed API item {item}: {e}")
@@ -197,9 +260,10 @@ Return ONLY a valid JSON array — no markdown, no explanation:
         for task in tasks:
             name     = task["name"]
             dur_min  = int(task.get("duration", 60))
-            ml_hour  = self._infer_ml_hour(task)
+            ml_start = task["ml_start"]
+            ml_hour  = ml_start.hour
 
-            # Look up rules (case-insensitive partial match)
+            # Look up rules (exact activity name)
             rule = self._find_rule(name)
 
             if rule:
@@ -207,7 +271,7 @@ Return ONLY a valid JSON array — no markdown, no explanation:
                 ideal_end   = rule.get("ideal_end", ideal_start + 2)
                 penalty     = rule.get("penalty_outside", 0.2)
 
-                if ideal_start <= ml_hour < ideal_end:
+                if in_window(ml_hour, ideal_start, ideal_end):
                     chosen_hour = ml_hour
                     score       = 0.9 + rule.get("bonus", 0.0)
                     reason      = f"✓ Ideal time for {name}"
@@ -228,7 +292,11 @@ Return ONLY a valid JSON array — no markdown, no explanation:
             # Check unhealthy patterns and apply extra penalty
             score, reason = self._check_unhealthy(name, chosen_hour, score, reason)
 
-            start_dt = datetime.combine(today, datetime.min.time()).replace(hour=chosen_hour, minute=0)
+            if chosen_hour == ml_hour:
+                # ML time kept → keep it exactly (incl. minutes)
+                start_dt = datetime.combine(today, ml_start.time()).replace(second=0, microsecond=0)
+            else:
+                start_dt = datetime.combine(today, datetime.min.time()).replace(hour=chosen_hour, minute=0)
             end_dt   = start_dt + timedelta(minutes=dur_min)
 
             schedule.append({
@@ -237,44 +305,24 @@ Return ONLY a valid JSON array — no markdown, no explanation:
                 "end_time":   end_dt,
                 "score":      min(1.0, max(0.0, score)),
                 "reason":     reason,
+                "source":     "rules",
             })
 
         return schedule
 
-    def _infer_ml_hour(self, task: dict) -> int:
-        """Extract the ML-predicted hour from a task dict (best effort)."""
-        dl = task.get("deadline")
-        if isinstance(dl, datetime):
-            # Back-estimate: assume ML puts it 1-2 h before deadline
-            return max(7, dl.hour - 1)
-        return 9  # safe default
-
     @staticmethod
     def _find_rule(name: str) -> dict | None:
-        """Case-insensitive partial key match against ACTIVITY_TIME_RULES."""
-        name_lower = name.lower()
-        for key, rule in ACTIVITY_TIME_RULES.items():
-            if key.lower() in name_lower or name_lower in key.lower():
-                return rule
-        return None
+        """Exact match on the dataset activity name."""
+        return ACTIVITY_TIME_RULES.get(name)
 
     @staticmethod
     def _check_unhealthy(name: str, hour: int, score: float, reason: str):
         """Apply unhealthy-pattern penalties from config."""
-        name_lower = name.lower()
         for pattern_name, pattern in UNHEALTHY_PATTERNS.items():
-            activities = [a.lower() for a in pattern.get("activity", [])]
-            if not any(a in name_lower for a in activities):
+            if name not in pattern.get("activity", []):
                 continue
-
-            after  = pattern.get("after_hour")
-            before = pattern.get("before_hour")
-            pen    = pattern.get("penalty", 0.2)
-
-            if after is not None and hour >= after:
-                score  -= pen
-                reason += f" | ⚠ Unhealthy pattern: {pattern_name}"
-            if before is not None and hour < before:
+            pen = pattern.get("penalty", 0.2)
+            if in_window(hour, *pattern["window"]):
                 score  -= pen
                 reason += f" | ⚠ Unhealthy pattern: {pattern_name}"
 

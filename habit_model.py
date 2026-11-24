@@ -1,10 +1,7 @@
 import joblib
 import numpy as np
 
-
-# Maps time buckets to representative hours
-# Adjust these if your dataset uses different bucket boundaries
-BUCKET_TO_HOUR = {0: 7, 1: 11, 2: 15, 3: 19}
+from preprocess import BUCKET_TO_HOUR   # shared bucket → hour map (includes night = 4)
 
 
 class HabitModel:
@@ -45,9 +42,9 @@ class HabitModel:
         Build habit profiles from a DataFrame.
 
         Required columns : Person_Encoded, Activity_Encoded, TimeBucket
-        Optional column  : Duration  (minutes)
+        Optional column  : 'Duration (minutes)'
         """
-        duration_col_exists = 'Duration' in df.columns
+        duration_col_exists = 'Duration (minutes)' in df.columns
 
         # ── Level 1: per person × activity ───────────────────────────────────
         for (person, activity), group in df.groupby(['Person_Encoded', 'Activity_Encoded']):
@@ -56,8 +53,8 @@ class HabitModel:
             confidence       = float(bucket_counts.max() / len(group))
 
             if duration_col_exists:
-                avg_dur = float(group['Duration'].mean())
-                std_dur = float(group['Duration'].std())
+                avg_dur = float(group['Duration (minutes)'].mean())
+                std_dur = float(group['Duration (minutes)'].std())
                 std_dur = 0.0 if np.isnan(std_dur) else std_dur
             else:
                 avg_dur = 60.0
@@ -79,8 +76,8 @@ class HabitModel:
             confidence       = float(bucket_counts.max() / len(group))
 
             if duration_col_exists:
-                avg_dur = float(group['Duration'].mean())
-                std_dur = float(group['Duration'].std())
+                avg_dur = float(group['Duration (minutes)'].mean())
+                std_dur = float(group['Duration (minutes)'].std())
                 std_dur = 0.0 if np.isnan(std_dur) else std_dur
             else:
                 avg_dur = 60.0
@@ -98,8 +95,8 @@ class HabitModel:
         # ── Level 3: global ───────────────────────────────────────────────────
         self.global_bucket = int(df['TimeBucket'].value_counts().idxmax())
         if duration_col_exists:
-            self.global_avg_duration = float(df['Duration'].mean())
-            self.global_std_duration = float(df['Duration'].std())
+            self.global_avg_duration = float(df['Duration (minutes)'].mean())
+            self.global_std_duration = float(df['Duration (minutes)'].std())
 
         print(f"Habit model trained.")
         print(f"  Person-activity profiles : {len(self.person_activity_profile)}")

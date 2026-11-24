@@ -10,10 +10,27 @@ class SchedulingEnv:
     
     TASK_FEATURES: int = 6  # pref, deadline, priority, dur, done, available
 
-    def __init__(self, max_tasks: int = MAX_TASKS) -> None:
-        self.max_tasks   = max_tasks
-        self.state_size  = 2 + max_tasks * self.TASK_FEATURES
-        self.action_size = max_tasks
+    ALL_REWARD_TERMS = ("habit", "buffer", "priority")
+
+    def __init__(self, max_tasks: int = MAX_TASKS,
+                 reward_terms: tuple = ALL_REWARD_TERMS,
+                 use_mode_flag: bool = True,
+                 use_pref: bool = True) -> None:
+        """
+        Ablation switches (Ablation 3; defaults = full model):
+          reward_terms  : bonus terms kept in _reward ("habit", "buffer", "priority")
+          use_mode_flag : False → state shows 0 instead of the habit/priority mode flag
+          use_pref      : False → state shows 0 instead of each task's preferred hour
+        Placement and metrics are unchanged; only what the agent sees / is rewarded for.
+        """
+        self.max_tasks     = max_tasks
+        self.state_size    = 2 + max_tasks * self.TASK_FEATURES
+        self.action_size   = max_tasks
+        unknown = set(reward_terms) - set(self.ALL_REWARD_TERMS)
+        assert not unknown, f"unknown reward terms {unknown}"
+        self.reward_terms  = tuple(reward_terms)
+        self.use_mode_flag = use_mode_flag
+        self.use_pref      = use_pref
 
     # ── reset ──────────────────────────────────────────────────────────────────
 
@@ -37,15 +54,16 @@ class SchedulingEnv:
     def _state(self) -> np.ndarray:
         s = np.zeros(self.state_size, dtype=np.float32)
         s[0] = (self.cur_hour - WORK_START) / (WORK_END - WORK_START)
-        s[1] = 1.0 if self.mode == "priority" else 0.0
+        s[1] = 1.0 if (self.use_mode_flag and self.mode == "priority") else 0.0
 
         for i in range(self.max_tasks):
             off = 2 + i * self.TASK_FEATURES
             if i < self.n:
                 t = self.tasks[i]
-                s[off + 0] = (t["Preferred_Hour"]     - WORK_START) / (WORK_END - WORK_START)
+                if self.use_pref:
+                    s[off + 0] = (t["Preferred_Hour"] - WORK_START) / (WORK_END - WORK_START)
                 s[off + 1] = (t["Deadline_Hour"]       - WORK_START) / (WORK_END - WORK_START)
-                s[off + 2] = t["Priority"] / 3.0
+                s[off + 2] = t["Priority"] / 4.0   # priority 1-4 → 0.25-1.0
                 s[off + 3] = t["Estimated_Duration"] / 480.0
                 s[off + 4] = 1.0 if self.done_mask[i] else 0.0
                 s[off + 5] = 0.0 if self.done_mask[i] else 1.0
@@ -120,7 +138,7 @@ class SchedulingEnv:
         """
         deadline = float(task["Deadline_Hour"])
         pref     = float(task["Preferred_Hour"])
-        priority = task["Priority"]          # 1 / 2 / 3
+        priority = task["Priority"]          # 1-4 (Low, Medium, High, Critical)
 
         # Can't fit in the working day
         if end > WORK_END:
@@ -128,7 +146,7 @@ class SchedulingEnv:
 
         # Missed deadline — penalty scales with priority (urgent missed = worse)
         if end > deadline:
-            return -8.0 - 2.5 * (priority / 3.0)
+            return -8.0 - 2.5 * (priority / 4.0)
 
         # ── deadline met ───────────────────────────────────────────────────────
         base      = 8.0
@@ -139,17 +157,20 @@ class SchedulingEnv:
             habit_bonus = 6.0 * max(0.0, 1.0 - deviation / 2.0)
             # Small priority spice (person isn't ignoring importance entirely)
             prio_bonus  = 0.5 * priority
-            return base + habit_bonus + prio_bonus
+            return (base + (habit_bonus if "habit" in self.reward_terms else 0.0)
+                         + (prio_bonus  if "priority" in self.reward_terms else 0.0))
 
         else:  # priority mode
             # Buffer bonus: finishing early frees up time for remaining tasks
             buffer       = deadline - end
             buffer_bonus = min(3.0, buffer * 0.7)
             # Priority matters more now
-            prio_bonus   = 2.0 * (priority / 3.0)
+            prio_bonus   = 2.0 * (priority / 4.0)
             # Residual habit (people under stress still prefer comfortable timings)
             habit_bonus  = 2.0 * max(0.0, 1.0 - deviation / 4.0)
-            return base + buffer_bonus + prio_bonus + habit_bonus
+            return (base + (buffer_bonus if "buffer"   in self.reward_terms else 0.0)
+                         + (prio_bonus   if "priority" in self.reward_terms else 0.0)
+                         + (habit_bonus  if "habit"    in self.reward_terms else 0.0))
 
     # ── conflict detection ─────────────────────────────────────────────────────
 
@@ -188,7 +209,7 @@ class SchedulingEnv:
             pref    = int(np.random.uniform(WORK_START, WORK_END - 3))
             dur_min = int(np.random.choice([15, 20, 30, 45, 60, 90, 120]))
             dur_h   = dur_min / 60.0
-            prio    = int(np.random.randint(1, 4))
+            prio    = int(np.random.randint(1, 5))     # 1-4, same scale as the app
 
             if kind == "habit":
                 slack = np.random.uniform(2.0, 5.0)
