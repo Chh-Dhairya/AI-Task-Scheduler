@@ -1,9 +1,15 @@
+# B10: this script reads AND overwrites the dataset, so re-running it changes
+# every result. The dataset has already been generated.
+raise SystemExit("Do not re-run: dataset already generated")
+
 import pandas as pd
 import numpy as np
 
+DATA_PATH = "activities_of_daily_living_fixed.csv"
+
 np.random.seed(42)
 
-df = pd.read_csv('C:\\Users\\user\\OneDrive\\Desktop\\task_scheduler\\activities_of_daily_living_fixed.csv')
+df = pd.read_csv(DATA_PATH)
 
 ACTIVITY_BASE_HOURS = {
     'Working':     9,
@@ -85,11 +91,11 @@ for _, row in df.iterrows():
     })
 
 df_fixed = pd.DataFrame(new_rows)
-df_fixed.to_csv('activities_of_daily_living_fixed.csv', index=False)
+df_fixed.to_csv(DATA_PATH, index=False)
 print("Saved to activities_of_daily_living_fixed.csv")
 
 # Verify
-df_check = pd.read_csv('activities_of_daily_living_fixed.csv')
+df_check = pd.read_csv(DATA_PATH)
 df_check['Hour'] = df_check['Start Time'].apply(lambda x: int(x.split(':')[0]))
 
 print("\nAverage start hour per activity:")

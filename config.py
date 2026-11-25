@@ -4,7 +4,30 @@ Contains all constants, weights, and API settings
 """
 import os
 
-API_KEY = os.getenv("API_KEY")
+
+def _load_dotenv(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+    """Read KEY=VALUE lines from .env (gitignored) into the environment.
+    A variable already set in the shell wins. No extra package needed."""
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
+# Secrets come from the environment or .env only. Never hard-code keys here.
+#   put  GEMINI_API_KEY="your-key"  in task_scheduler/.env   (gitignored)
+#   or   export GEMINI_API_KEY="your-key"
+#   export GEMINI_MODEL="gemini-3.6-flash"   # optional override
+API_KEY = os.getenv("GEMINI_API_KEY", "")
+# gemini-3.6-flash: stable, no shutdown date (checked deprecations page 2026-11-18).
+# Not gemini-3.5-flash: that id is silently re-routed to 3.6, so the report would name the wrong model.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 # ============================================================================
 # SCHEDULING WEIGHTS
 # ============================================================================
@@ -26,22 +49,25 @@ MAX_TASK_DURATION = 480  # 8 hours
 # ============================================================================
 # ACTIVITY RULES (For API Scoring)
 # ============================================================================
+# Keys are the exact activity names used in the dataset ('Activity Type').
+# Windows are [ideal_start, ideal_end) in hours; if start > end the window
+# wraps past midnight (e.g. Sleeping 21 → 1 means 21:00-01:00).
 ACTIVITY_TIME_RULES = {
-    'Breakfast': {'ideal_start': 7, 'ideal_end': 9, 'penalty_outside': 0.3},
-    'Lunch': {'ideal_start': 12, 'ideal_end': 14, 'penalty_outside': 0.3},
-    'Dinner': {'ideal_start': 18, 'ideal_end': 21, 'penalty_outside': 0.3},
-    'Sleep': {'ideal_start': 22, 'ideal_end': 7, 'penalty_outside': 0.5},
-    'Exercise': {'ideal_start': 6, 'ideal_end': 10, 'bonus': 0.2},
-    'Work': {'ideal_start': 9, 'ideal_end': 18, 'penalty_outside': 0.2},
-    'Study': {'ideal_start': 9, 'ideal_end': 22, 'penalty_outside': 0.1},
+    'Eating':     {'ideal_start': 7,  'ideal_end': 21, 'penalty_outside': 0.3},
+    'Cooking':    {'ideal_start': 7,  'ideal_end': 21, 'penalty_outside': 0.2},
+    'Sleeping':   {'ideal_start': 21, 'ideal_end': 1,  'penalty_outside': 0.5},  # wraps midnight
+    'Exercising': {'ideal_start': 6,  'ideal_end': 10, 'bonus': 0.1, 'penalty_outside': 0.2},
+    'Working':    {'ideal_start': 9,  'ideal_end': 18, 'penalty_outside': 0.2},
+    'Walking':    {'ideal_start': 6,  'ideal_end': 20, 'penalty_outside': 0.1},
+    'Shopping':   {'ideal_start': 9,  'ideal_end': 21, 'penalty_outside': 0.1},
 }
 
-# Unhealthy patterns
+# Unhealthy patterns: a start hour inside 'window' [start, end) is penalised.
 UNHEALTHY_PATTERNS = {
-    'late_eating': {'activity': ['Breakfast', 'Lunch', 'Dinner'], 'after_hour': 22, 'penalty': 0.4},
-    'late_sleep': {'activity': ['Sleep'], 'after_hour': 1, 'penalty': 0.5},
-    'early_sleep': {'activity': ['Sleep'], 'before_hour': 20, 'penalty': 0.2},
-    'night_exercise': {'activity': ['Exercise'], 'after_hour': 21, 'penalty': 0.3},
+    'late_eating':    {'activity': ['Eating'],     'window': (22, 5),  'penalty': 0.4},
+    'late_sleep':     {'activity': ['Sleeping'],   'window': (1, 12),  'penalty': 0.5},
+    'early_sleep':    {'activity': ['Sleeping'],   'window': (12, 20), 'penalty': 0.2},
+    'night_exercise': {'activity': ['Exercising'], 'window': (21, 5),  'penalty': 0.3},
 }
 
 # ============================================================================

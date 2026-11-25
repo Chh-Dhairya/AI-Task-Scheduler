@@ -16,19 +16,14 @@ from datetime import datetime, timedelta          # ← fix: timedelta at top
 from duration_model import DurationModel
 from data_loader    import load_dataset
 from preprocess     import DataPreprocessor
-from scheduler      import schedule_tasks
+from ml_pipeline    import (create_ml_schedule, prepare_tasks_for_api,   # B8
+                            unscheduled_tasks, MAX_TASKS)
 from habit_model    import HabitModel
 from api_scheduler  import APIScheduler
 from fusion_engine  import ScheduleFusionEngine
 from config         import DEFAULT_MODEL_WEIGHT, DEFAULT_API_WEIGHT
 
-BUCKET_TO_HOUR = {
-    0: 7,
-    1: 11,
-    2: 15,
-    3: 19,
-    4: 22,
-}
+from preprocess     import BUCKET_TO_HOUR   # shared map, single source of truth
 
 DATA_PATH          = "activities_of_daily_living_fixed.csv"
 HABIT_MODEL_PATH   = "habit_model.pkl"
@@ -94,10 +89,11 @@ def main():
     except ValueError:
         print("❌ Invalid number.")
         return
+    if not 1 <= num_tasks <= MAX_TASKS:          # B8: the PPO has 10 task slots
+        print(f"❌ Please enter 1 to {MAX_TASKS} tasks.")
+        return
 
     tasks              = []
-    ml_schedule_tasks  = []
-    api_tasks          = []
 
     for i in range(num_tasks):
         print(f"\n{'=' * 60}")
@@ -107,6 +103,9 @@ def main():
         task_name = input("📝 Activity Type: ").strip()
         if task_name not in preprocessor.activity_encoder.classes_:
             print(f"  ⚠️  '{task_name}' not recognised — skipping.")
+            continue
+        if any(t["Task"] == task_name for t in tasks):   # B8: tasks are matched by name
+            print(f"  ⚠️  '{task_name}' already added (each activity once) — skipping.")
             continue
 
         activity_encoded = preprocessor.activity_encoder.transform([task_name])[0]
@@ -145,31 +144,6 @@ def main():
         }
         tasks.append(task)
 
-        # Prepare ML schedule entry (uses datetime + timedelta properly)
-        task_start = datetime.now().replace(
-            hour=predicted_hour, minute=0, second=0, microsecond=0
-        )
-        task_end = task_start + timedelta(minutes=predicted_duration)   # ← fix
-
-        ml_schedule_tasks.append({
-            "task":                  task_name,
-            "start_time":            task_start,
-            "end_time":              task_end,
-            "ml_score":              confidence,
-            "rl_reward":             0.8,
-            "habit_alignment":       confidence,
-            "deadline_satisfaction": 1.0 if predicted_hour <= deadline_hour else 0.5,
-            "priority_score":        priority / 4.0,
-        })
-
-        api_tasks.append({
-            "name":     task_name,
-            "duration": int(predicted_duration),
-            "priority": priority,
-            "deadline": datetime.now().replace(hour=deadline_hour, minute=0,
-                                               second=0, microsecond=0),
-        })
-
     if not tasks:
         print("\n❌ No valid tasks entered.")
         return
@@ -178,6 +152,15 @@ def main():
     print("\n" + "=" * 80)
     print("  GENERATING HYBRID SCHEDULE")
     print("=" * 80)
+
+    # B8: the ML schedule comes from the PPO scheduler (same code as app.py)
+    print("\n🤖 PPO scheduler ordering tasks...")
+    ml_schedule_tasks = create_ml_schedule(tasks)
+    api_tasks         = prepare_tasks_for_api(tasks, ml_schedule_tasks)
+    unscheduled       = unscheduled_tasks(tasks, ml_schedule_tasks)
+    if unscheduled:
+        print(f"⚠️  Could not be scheduled (not enough time before 22:00): "
+              f"{', '.join(unscheduled)}")
 
     print("\n🌐 Getting API recommendations...")
     api_schedule = api_scheduler.get_schedule(api_tasks)
@@ -194,8 +177,9 @@ def main():
     print("\n" + "=" * 80)
     print("  FINAL HYBRID SCHEDULE")
     print("=" * 80)
-    print(f"\nML Weight  : {fusion_engine.model_weight:.0%}  |  "
-          f"API Weight : {fusion_engine.api_weight:.0%}")
+    w_ml, w_api = fusion_engine.last_weights   # weights actually used (after adaptive)
+    print(f"\nML Weight  : {w_ml:.0%}  |  "
+          f"API Weight : {w_api:.0%}")
     print(f"Avg Confidence : {avg_confidence:.0%}\n")
 
     for idx, item in enumerate(fused_schedule, 1):

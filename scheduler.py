@@ -11,6 +11,11 @@ RL_MODEL_PATH        = "rl_scheduler.pth"
 
 def schedule_tasks(tasks: list) -> list:
     today     = datetime.now().date()
+    # Whole-minute durations, used by BOTH the PPO env (ordering) and
+    # _place_tasks (placement), so the agent plans with the exact times that
+    # are then placed (B7).
+    tasks     = [{**t, "Estimated_Duration": max(1, round(t["Estimated_Duration"]))}
+                 for t in tasks]
     regular   = [t for t in tasks if t["Task"] not in OVERNIGHT_ACTIVITIES]
     overnight = [t for t in tasks if t["Task"] in OVERNIGHT_ACTIVITIES]
     schedule  = []
@@ -63,14 +68,21 @@ def schedule_tasks(tasks: list) -> list:
 
 def _rl_order(tasks: list) -> list:
     """
-    Ask the trained DQN agent to choose a task ordering.
+    Ask the trained PPO agent (DQNAgent is an alias of PPOAgent) to choose a task ordering.
 
     The agent runs in pure-exploitation mode (ε = 0).  It sees the full
     state (current time, mode flag, per-task features) and picks tasks
     one-by-one until all are scheduled.
     """
+    import torch
     from rl_environment import SchedulingEnv
     from rl_agent       import DQNAgent
+
+    # The app/CLI load the XGBoost duration model first. XGBoost and PyTorch each
+    # ship their own OpenMP (libomp); on macOS multi-threaded torch ops then
+    # deadlock (seen in orthogonal_ init). Inference for one day is tiny, so use
+    # a single thread — this also keeps results deterministic.
+    torch.set_num_threads(1)
 
     env   = SchedulingEnv(max_tasks=10)
     agent = DQNAgent(state_size=env.state_size, action_size=env.action_size)
@@ -151,10 +163,10 @@ def _place_tasks(ordered: list, today) -> list:
     Convert an ordered task list into a list of schedule entries with
     real datetime start/end values.
 
-    Placement rules (same in both modes — only order differs):
+    Placement rules (same in both modes — only order differs), identical to
+    SchedulingEnv.step so the PPO agent is used in the world it was trained in (B7):
       1. Start at max(current_time, preferred_hour)  — honour the habit.
-      2. If that would bust the deadline (accounting for same-deadline
-         peers still to come), pull start back to fit.
+      2. If that would bust the deadline, pull start back to fit.
       3. Never schedule before current_time.
       4. Never exceed WORK_END.
     """
@@ -167,15 +179,8 @@ def _place_tasks(ordered: list, today) -> list:
         deadline_h  = float(task["Deadline_Hour"])
         preferred_h = float(task["Preferred_Hour"])
 
-        # Time that same-deadline peers still to be scheduled will need
-        reserved_h = sum(
-            max(1, round(t["Estimated_Duration"])) / 60.0
-            for t in ordered
-            if t is not task
-            and t["Deadline_Hour"] == task["Deadline_Hour"]
-            and not any(e["Task"] == t["Task"] for e in entries)
-        )
-        must_finish_by = deadline_h - reserved_h
+        # B7: no extra time reserved for same-deadline peers (the env doesn't)
+        must_finish_by = deadline_h
 
         # ── habit-first placement ─────────────────────────────────────────────
         task_start = max(current_h, preferred_h)

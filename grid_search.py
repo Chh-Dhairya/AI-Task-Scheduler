@@ -7,7 +7,9 @@ import os
 from datetime import datetime
 
 from rl_environment import SchedulingEnv
-from train_rl_scheduler import CurriculumEnv, evaluate
+from train_rl_scheduler import CurriculumEnv, evaluate, VAL_PATH
+from ablation.common import load_json
+VAL_SCENARIOS = load_json(VAL_PATH)   # B5: tune on the fixed validation bank
 from rl_agent import PPOAgent
 
 # ── GPU SETUP ────────────────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ for i, values in enumerate(sampled):
 
     # ── Evaluate ──
     eval_env = SchedulingEnv(max_tasks=10)
-    metrics  = evaluate(agent, eval_env)
+    metrics  = evaluate(agent, eval_env, VAL_SCENARIOS)
 
     deadline = metrics["deadline_acc"]
     habit    = metrics["habit_acc"]

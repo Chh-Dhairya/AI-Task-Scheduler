@@ -172,7 +172,7 @@ class RunningStats:
     Used to normalise rewards on-the-fly without storing the full reward history.
     Normalised rewards have zero mean and unit variance, which keeps the value
     function's target scale stable and speeds up critic learning.
-    reward → (reward - mean) / std
+    normalise(): (reward - mean) / std   (used only by norm_mode="mean_std")
     """
 
     def __init__(self):
@@ -291,10 +291,14 @@ class PPOAgent:
         # Ensures agent does not become completely deterministic.
 
         ent_decay: float = 0.9995,
-        # Entropy decay rate.
-        # Gradually reduces exploration over time:
-        # early → explore many schedules
-        # later → exploit best learned strategy
+        # UNUSED since fix B2 (kept so old callers don't break). The old per-update
+        # multiplicative decay only moved 0.050 → ~0.049 in a full run.
+        # Entropy now decays linearly ent_coef → ent_coef_min over total_updates.
+
+        total_updates: int = 50,
+        # Expected number of PPO updates in the whole training run
+        # (≈ total env steps / buffer_size; train() computes it).
+        # Sets the length of the linear entropy decay and the cosine LR schedule.
 
         buffer_size: int = 2048,
         # Number of experiences stored before updating the model.
@@ -302,9 +306,21 @@ class PPOAgent:
         # Stores (state, action, reward, next_state).
 
         normalise_rewards: bool = True,
-        # Whether to normalize rewards.
+        # Whether to normalize rewards (False forces norm_mode="none").
         # Helps stabilize training by scaling rewards to similar range.
         # Prevents large reward values from destabilizing learning.
+
+        norm_mode: str = "std",
+        # How rewards are normalised (fix B3; all three are compared in Ablation 3, T3):
+        #   "std"      → reward / running_std           (default: scale only, keeps sign)
+        #   "mean_std" → (reward - mean) / running_std  (old behaviour: can flip a good
+        #                reward negative once the running mean is high)
+        #   "none"     → raw reward
+
+        buggy_gae: bool = False,
+        # False (default) = correct GAE: the advantage sum is reset at episode ends.
+        # True = old buggy behaviour (advantages leak across episodes); kept only
+        # for the PPO ablation (variant T1).
 
         # ── DQN-compatible stubs ─────────────────────────────────────────────
         # These parameters are accepted for API compatibility with DQNAgent
@@ -325,9 +341,14 @@ class PPOAgent:
         self.batch_size        = batch_size
         self.vf_coef           = vf_coef
         self.ent_coef          = ent_coef          # Will decay during training
+        self.ent_start         = ent_coef          # Start value of the linear decay
         self.ent_coef_min      = ent_coef_min
-        self.ent_decay         = ent_decay
-        self.normalise_rewards = normalise_rewards
+        self.ent_decay         = ent_decay         # unused (see B2)
+        self.total_updates     = max(1, int(total_updates))
+        assert norm_mode in ("std", "mean_std", "none"), norm_mode
+        self.norm_mode         = norm_mode if normalise_rewards else "none"
+        self.normalise_rewards = self.norm_mode != "none"
+        self.buggy_gae         = buggy_gae
 
         # ── DQN compatibility stubs ───────────────────────────────────────────
         # eps is kept so code that calls agent.eps still works without errors.
@@ -340,10 +361,10 @@ class PPOAgent:
         # ── Network and optimiser ─────────────────────────────────────────────
         self.net       = ActorCritic(state_size, action_size, hidden).to(self.device)
         self.optimizer = optim.Adam(self.net.parameters(), lr=lr, eps=1e-5)
-        # Cosine annealing gradually reduces LR from lr → lr*0.1 over T_max updates,
-        # allowing large early steps and fine-tuning later.
+        # Cosine annealing reduces LR from lr → lr*0.1 over total_updates PPO updates
+        # (stepped once per update), allowing large early steps and fine-tuning later.
         self.lr_sched  = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=10_000, eta_min=lr * 0.1
+            self.optimizer, T_max=self.total_updates, eta_min=lr * 0.1
         )
 
         # ── Buffer and reward normaliser ──────────────────────────────────────
@@ -421,8 +442,8 @@ class PPOAgent:
         """
         Store a transition in the rollout buffer.
 
-        If reward normalisation is enabled, the reward is standardised using
-        running statistics before storage, which stabilises critic training.
+        If reward normalisation is enabled, the reward is scaled using running
+        statistics before storage (see norm_mode), which stabilises critic training.
 
         Args:
             state:      State observed before the action.
@@ -435,9 +456,12 @@ class PPOAgent:
             The log_prob, value, and mask from the most recent act() call are
             automatically attached — act() must be called before remember().
         """
-        if self.normalise_rewards:
+        if self.norm_mode != "none":
             self.rew_stat.update(reward)
-            reward = self.rew_stat.normalise(reward)
+            if self.norm_mode == "std":
+                reward = reward / self.rew_stat.std          # scale only (B3)
+            else:  # "mean_std"
+                reward = self.rew_stat.normalise(reward)     # old: shift + scale
 
         self.buffer.add(
             state, action, reward, next_state, done,
@@ -463,8 +487,8 @@ class PPOAgent:
                c. Compute value function loss (Smooth L1 / Huber).
                d. Subtract entropy bonus to encourage exploration.
                e. Back-propagate and clip gradients to prevent explosions.
-            6. Decay entropy coefficient and step LR scheduler periodically.
-            7. Clear the buffer for the next rollout.
+            6. Clear the buffer for the next rollout.
+            7. Decay entropy linearly and step the cosine LR schedule (every update).
 
         Returns:
             Average loss per mini-batch, or None if the buffer is not yet full.
@@ -498,8 +522,11 @@ class PPOAgent:
         for t in reversed(range(len(R))):
             # TD error: r + γ·V(s') - V(s)
             delta  = R[t] + self.gamma * nv[t] - OLD_V[t]
-            # GAE accumulates discounted TD errors backward through time
-            gae    = delta + self.gamma * self.gae_lambda * gae
+            # GAE accumulates discounted TD errors backward through time, but must
+            # stop at an episode end (D[t] = 1), otherwise the next episode's
+            # advantages leak into this one. buggy_gae=True restores the old leak.
+            not_done = 1.0 if self.buggy_gae else (1.0 - D[t])
+            gae    = delta + self.gamma * self.gae_lambda * not_done * gae
             adv[t] = gae
 
         # ── 3. Compute returns (targets for the value function) ───────────────
@@ -550,15 +577,18 @@ class PPOAgent:
                 self.optimizer.step()
                 total_loss += loss.item()
 
-        # ── 6. Anneal entropy coefficient ─────────────────────────────────────
-        # Gradually shift from exploration (high entropy) to exploitation (low entropy).
-        self.ent_coef = max(self.ent_coef_min, self.ent_coef * self.ent_decay)
-
-        # ── 7. Housekeeping ───────────────────────────────────────────────────
+        # ── 6. Housekeeping ───────────────────────────────────────────────────
         self.buffer.clear()     # On-policy: discard data after each update
         self._updates += 1
-        if self._updates % 200 == 0:
-            self.lr_sched.step()    # Cosine LR step every 200 PPO updates
+
+        # ── 7. Anneal entropy (linear) and LR (cosine), once per update ───────
+        # Shift from exploration (high entropy) to exploitation (low entropy).
+        frac = min(1.0, self._updates / self.total_updates)
+        self.ent_coef = self.ent_start + frac * (self.ent_coef_min - self.ent_start)
+        # CosineAnnealingLR rises again after T_max, so stop stepping at the end
+        # (LR then stays at its minimum if training runs longer than expected).
+        if self._updates <= self.total_updates:
+            self.lr_sched.step()
 
         batches = self.ppo_epochs * max(1, n // self.batch_size)
         return total_loss / batches   # Average loss per mini-batch

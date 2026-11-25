@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+taskplanner_env/
+venv/
+
+# Models
+*.pkl
+*.pth
+
+# Experiment outputs
+grid_search_results*.csv
+
+# OS files
+.DS_Store
+Thumbs.db
+# Datasets
+*.csv
+# Secrets
+.env
+
+# Trained models are shipped so the app runs right after cloning
+!habit_model.pkl
+!duration_model.pkl
+!rl_scheduler.pth

@@ -1,135 +1,86 @@
 # AI-Driven Personalized Life Planner
 
-An intelligent task scheduling system that combines **Machine Learning (XGBoost)**, **Reinforcement Learning (PPO)**, and **Large Language Models (Gemini)** to generate personalized, adaptive, and realistic daily schedules.
+A hybrid AI task scheduler that builds a personalised daily schedule. It learns **when** a person usually does each activity, predicts **how long** each one takes, uses a **PPO reinforcement-learning agent** to decide the order, and corrects unhealthy timings with an **LLM (Gemini) plus a rule engine**. A fusion engine merges the ML and LLM schedules, and the result is shown in a Streamlit dashboard or a command-line interface.
 
-## Overview
-
-Traditional productivity tools rely on manual planning and static scheduling. This project introduces a hybrid AI framework that predicts task durations, learns user habits, optimizes task sequencing, and refines schedules using semantic reasoning.
-
-The system aims to maximize productivity while respecting deadlines, user preferences, and real-world behavioral constraints.
-
-## Key Features
-
-* **Task Duration Prediction** using XGBoost regression
-* **Habit Learning Module** for personalized scheduling
-* **PPO-based Reinforcement Learning Scheduler**
-* **LLM-based Behavioral Correction** using Gemini API
-* **Adaptive Fusion Engine** for combining ML, RL, and LLM outputs
-* **Streamlit Dashboard** for user interaction
-
-## System Pipeline
+## Pipeline
 
 ```text
-User Tasks
-    ↓
-Input Processing
-    ↓
-Habit Learning
-    ↓
-Duration Prediction (XGBoost)
-    ↓
-RL Scheduler (PPO)
-    ↓
-LLM Schedule Refinement
-    ↓
-Fusion Engine
-    ↓
-Final Optimized Schedule
+User tasks (activity, priority, deadline)
+    │
+    ├─► Habit model ─────────► preferred time + confidence      (habit_model.py)
+    ├─► Duration model ──────► minutes per task (XGBoost)        (duration_model.py)
+    │
+    ▼
+PPO scheduler ───────────────► task order + placement 07:00–22:00 (scheduler.py, rl_agent.py)
+    │   = ML schedule                                            (ml_pipeline.py)
+    ▼
+Gemini / rule fallback ──────► health-corrected times + score    (api_scheduler.py, config.py)
+    │
+    ▼
+Fusion engine ───────────────► final = w_ML·ML + w_API·API,       (fusion_engine.py)
+    │                            overlaps resolved by score
+    ▼
+Streamlit dashboard (app.py) / CLI (main.py)
 ```
 
-## Tech Stack
+## Components
 
-| Category        | Technologies                    |
-| --------------- | ------------------------------- |
-| Language        | Python                          |
-| ML              | Scikit-Learn, XGBoost           |
-| RL              | Stable-Baselines3, PPO, PyTorch |
-| Data Processing | Pandas, NumPy                   |
-| LLM             | Gemini API                      |
-| UI              | Streamlit                       |
-| Development     | VS Code                         |
+| Component | File(s) | Method |
+| --- | --- | --- |
+| Data loading and features | `data_loader.py`, `preprocess.py` | Timestamps, 5 time buckets (shared `BUCKET_TO_HOUR`), label encoding, day of week |
+| Habit model | `habit_model.py`, `train_habit.py` | 3-level frequency lookup: person × activity → activity → global, with confidence |
+| Duration model | `duration_model.py`, `train_duration.py` | XGBoost regressor on activity, hour and weekday; p99 cap; early stopping on a validation month |
+| RL environment | `rl_environment.py` | 62-dim state, masked discrete actions, habit/priority-mode shaped reward, priority 1–4 |
+| PPO agent | `rl_agent.py` | Actor-critic, clipped objective, GAE (reset at episode ends), linear entropy decay, cosine LR, reward scaling |
+| PPO training | `train_rl_scheduler.py`, `grid_search.py` | Curriculum (≤4 → ≤7 → ≤10 tasks), seeded runs, fixed validation/test scenario banks |
+| Scheduler | `scheduler.py`, `ml_pipeline.py` | PPO ordering and habit-first placement; the same code is used by the app and the CLI |
+| LLM correction | `api_scheduler.py`, `config.py` | Gemini (temperature 0, JSON mode) receives the ML start times; a rule engine with midnight-wrapping windows is the fallback |
+| Fusion | `fusion_engine.py` | Weighted score, adaptive weights from habit confidence, weighted decision rule, score-aware overlap resolution |
+| Interfaces | `app.py`, `main.py` | Streamlit dashboard (timeline, analytics, CSV export) and an interactive CLI |
+| Ablation study | `ablation/` | Experiments for every component (see below) |
 
-## Reinforcement Learning Formulation
-
-### State Space
-
-* Current time
-* Task features
-* Completion status
-* User habit information
-
-### Actions
-
-* Select next task to schedule
-
-### Reward Function
-
-* Deadline satisfaction
-* Priority completion
-* Habit alignment
-* Early completion bonuses
-* Penalties for invalid scheduling and missed deadlines
-
-### Algorithm
-
-* Proximal Policy Optimization (PPO)
-
-## Evaluation Metrics
-
-* Mean Absolute Error (MAE)
-* Habit Accuracy
-* Deadline Accuracy
-* Scheduling Success Rate
-* RL Reward
-* Behavioral Compliance Score
-* Composite Schedule Score
-
-## Results
-
-| Metric                  | Value        |
-| ----------------------- | ------------ |
-| Duration Prediction MAE | ~18.49 min   |
-| Habit Accuracy          | ~81.72%      |
-| Composite Score         | 0.949        |
-| Scheduler               | PPO-based RL |
-
-The hybrid architecture successfully balances task deadlines, user habits, and schedule feasibility while generating realistic and personalized schedules.
-
-## Repository Structure
+## Repository layout
 
 ```text
 .
-├── app.py
-├── requirements.txt
-├── data/
-├── models/
-├── modules/
-│   ├── preprocessing.py
-│   ├── habit_learning.py
-│   ├── duration_prediction.py
-│   ├── rl_scheduler.py
-│   ├── llm_correction.py
-│   └── fusion_engine.py
-├── screenshots/
-├── Project_Report.pdf
+├── app.py                     # Streamlit dashboard
+├── main.py                    # CLI
+├── ml_pipeline.py             # shared ML-side pipeline (PPO schedule → API input)
+├── config.py                  # weights, health rules, Gemini settings (.env)
+├── data_loader.py, preprocess.py
+├── habit_model.py, duration_model.py
+├── rl_environment.py, rl_agent.py, scheduler.py
+├── api_scheduler.py, fusion_engine.py
+├── train_habit.py, train_duration.py, train_rl_scheduler.py
+├── grid_search.py, grid_search_duration.py   # hyperparameter search
+├── fix_dataset.py             # one-off dataset generator (already run; refuses to re-run)
+├── habit_model.pkl, duration_model.pkl, rl_scheduler.pth   # trained models
+├── activities_of_daily_living_fixed.csv                  # dataset
+├── ablation/                  # ablation study: scripts, scenario banks, cache, figures
+├── requirements.txt, requirements.lock
 └── README.md
 ```
 
-## Installation
+## Setup
 
 ```bash
-git clone <repository-url>
-cd AI-Life-Planner
-
+git clone https://github.com/Chh-Dhairya/AI-Task-Scheduler.git
+cd AI-Task-Scheduler
 python -m venv venv
-source venv/bin/activate   # Linux/macOS
-
-# or
-
-venv\Scripts\activate      # Windows
-
-pip install -r requirements.txt
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt   # or requirements.lock for the exact tested versions
 ```
+
+### Gemini API key (optional)
+
+Create a file named `.env` in the project folder. It is gitignored, so never commit it.
+
+```text
+GEMINI_API_KEY="your-key"
+# GEMINI_MODEL="gemini-3.6-flash"   # optional override
+```
+
+Without a key the app still runs: the rule engine in `api_scheduler.py` takes over the LLM's role.
 
 ## Run
 
@@ -137,25 +88,64 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Future Work
+```bash
+python main.py
+```
 
-* Google Calendar & Outlook integration
-* Real-time schedule adaptation
-* Multi-day planning
-* Mobile application support
-* Context-aware scheduling
-* Multi-agent planning framework
+The trained models are included, so both work right after installation.
+
+## Train the models
+
+```bash
+python train_habit.py
+```
+
+```bash
+python train_duration.py
+```
+
+```bash
+python train_rl_scheduler.py --seed 0 --episodes 80000
+```
+
+The habit and duration models use a time-based split: train on January–April, validate on May, and test on June. The habit model also reports a cold-start test on 50 held-out people. The PPO agent picks its checkpoint on a fixed validation bank (`ablation/data/rl_val.json`) and reports its score once on a separate test bank (`ablation/data/rl_test.json`).
+
+## Ablation study
+
+Each script in `ablation/` removes or swaps one part of the system and measures the effect. Run them from the project root:
+
+| Ablation | Command |
+| --- | --- |
+| 1. Duration model | `python -m ablation.run_duration` |
+| 2. Habit model (personalisation, fallback levels, time resolution) | `python -m ablation.run_habit` |
+| 3. PPO scheduler (variants × seeds, rule baselines) | `python -m ablation.run_ppo_all`, then `python -m ablation.report_ppo` |
+| 4. LLM correction | `python -m ablation.run_llm --no-llm` (offline) |
+| 5. Fusion engine | `python -m ablation.run_fusion` |
+| Full system, one part removed at a time | `python -m ablation.run_full` |
+
+Figures are in `ablation/figures/`. Cached Gemini responses in `ablation/cache/` make the LLM runs reproducible without a key.
+
+## Dataset
+
+`activities_of_daily_living_fixed.csv` has 50,000 activity logs from 500 people across 10 activities, January–June 2023. The start times were regenerated by `fix_dataset.py` so that each person has a consistent preferred time per activity. This makes it a semi-synthetic benchmark for checking the pipeline against known habits.
+
+## Future work
+
+- Google Calendar and Outlook integration
+- Real-time rescheduling and multi-day planning
+- Learning fusion weights from user feedback
+- Validation on real (non-synthetic) activity logs
 
 ## Authors
 
-* Dhairya Chhabra
-* Karan Dhingra
-* Nalin Chandola
+- Dhairya Chhabra
+- Karan Dhingra
+- Nalin Chandola
 
 **Mentor:** Dr. Malika Acharya
 Department of Electronics and Communication Engineering
 The LNM Institute of Information Technology (LNMIIT), Jaipur
 
-## Project Report
+## License
 
-For detailed methodology, mathematical formulation, experiments, and results, refer to **Project_Report.pdf** included in this repository.
+MIT, see [LICENSE](LICENSE).

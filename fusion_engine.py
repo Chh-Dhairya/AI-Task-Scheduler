@@ -30,11 +30,20 @@ class ScheduleFusionEngine:
     def __init__(self,
                  model_weight: float = DEFAULT_MODEL_WEIGHT,
                  api_weight: float = DEFAULT_API_WEIGHT,
-                 adaptive: bool = ENABLE_ADAPTIVE_WEIGHTING):
+                 adaptive: bool = ENABLE_ADAPTIVE_WEIGHTING,
+                 decision_rule: str = "weighted"):
         self.model_weight = model_weight
         self.api_weight   = api_weight
         self.adaptive     = adaptive
+        # "weighted": time comes from the side with higher weight × score (default)
+        # "raw"     : old rule, higher raw score wins, weights ignored (Ablation 5c, D0)
+        assert decision_rule in ("weighted", "raw"), decision_rule
+        self.decision_rule = decision_rule
+        # Weights actually used in the last combine_schedules() call (for display only;
+        # never fed back, so repeated calls do not drift).
+        self.last_weights = (model_weight, api_weight)
         self._normalize_weights()
+        self.last_weights = (self.model_weight, self.api_weight)
         logger.info(
             f"Fusion Engine initialized: ML={self.model_weight:.2f}, "
             f"API={self.api_weight:.2f}"
@@ -79,12 +88,15 @@ class ScheduleFusionEngine:
         ───────
         Sorted, conflict-resolved list of fused task dicts.
         """
-        # Adaptive weight adjustment
+        # Adaptive weight adjustment: stateless. Never written back to self,
+        # so the base weights stay fixed across calls.
+        w_ml, w_api = self.model_weight, self.api_weight
         if self.adaptive and habit_confidence is not None:
-            self.model_weight, self.api_weight = self._adjust_weights(habit_confidence)
+            w_ml, w_api = self._adjust_weights(habit_confidence)
+        self.last_weights = (w_ml, w_api)
 
         matched_tasks  = self._match_tasks(ml_schedule, api_schedule)
-        fused_schedule = [self._fuse_single_task(t) for t in matched_tasks]
+        fused_schedule = [self._fuse_single_task(t, w_ml, w_api) for t in matched_tasks]
         fused_schedule = self._resolve_conflicts(fused_schedule)
         fused_schedule = sorted(fused_schedule, key=lambda x: x["start_time"])
         return fused_schedule
@@ -145,7 +157,7 @@ class ScheduleFusionEngine:
 
     # ── single-task fusion ────────────────────────────────────────────────────
 
-    def _fuse_single_task(self, task_data: Dict) -> Dict[str, Any]:
+    def _fuse_single_task(self, task_data: Dict, w_ml: float, w_api: float) -> Dict[str, Any]:
         """Compute weighted score and choose the best timing for one task."""
         task_name = task_data["task_name"]
         ml_data   = task_data["ml_data"]
@@ -186,27 +198,32 @@ class ScheduleFusionEngine:
         ml_score  = float(ml_data.get("ml_score", 0.7))
         api_score = float(api_data.get("score",   0.7))
 
-        final_score = (self.model_weight * ml_score) + (self.api_weight * api_score)
+        final_score = (w_ml * ml_score) + (w_api * api_score)
 
-        # Choose timing from whichever source scored higher
-        if ml_score >= api_score:
-            chosen_start   = ml_data["start_time"]
-            chosen_end     = ml_data["end_time"]
-            dominant_source = "ML"
+        # Choose timing
+        if self.decision_rule == "raw":
+            # Old rule: higher raw score wins; weights have no effect on the time
+            use_ml = ml_score >= api_score
         else:
-            chosen_start   = api_data["start_time"]
-            chosen_end     = api_data["end_time"]
-            dominant_source = "API"
+            # Weighted rule: higher weight × score wins. On an exact tie the side
+            # with the larger weight wins (so w_ml = 0 always means API, w_api = 0 ML).
+            ml_side, api_side = w_ml * ml_score, w_api * api_score
+            use_ml = ml_side > api_side or (ml_side == api_side and w_ml >= w_api)
+
+        if use_ml:
+            chosen_start, chosen_end, dominant_source = ml_data["start_time"], ml_data["end_time"], "ML"
+        else:
+            chosen_start, chosen_end, dominant_source = api_data["start_time"], api_data["end_time"], "API"
 
         # Influence percentages (avoid div-by-zero)
         if final_score > 0:
-            ml_influence  = (self.model_weight * ml_score  / final_score) * 100
+            ml_influence  = (w_ml * ml_score  / final_score) * 100
         else:
             ml_influence  = 50.0
         api_influence = 100.0 - ml_influence
 
         reason = self._generate_fusion_reason(
-            ml_score, api_score, api_data.get("reason", "")
+            ml_score, api_score, api_data.get("reason", ""), dominant_source
         )
 
         return {
@@ -225,62 +242,40 @@ class ScheduleFusionEngine:
     @staticmethod
     def _generate_fusion_reason(ml_score: float,
                                  api_score: float,
-                                 api_reason: str) -> str:
+                                 api_reason: str,
+                                 source: str) -> str:
+        # The label must agree with the source that actually set the time.
+        if source == "API":
+            return f"API-corrected (health-based) | {api_reason}"
         if ml_score > api_score + 0.2:
             return f"ML-dominant (habit-based) | {api_reason}"
         if api_score > ml_score + 0.2:
-            return f"API-corrected (health-based) | {api_reason}"
-        return f"Balanced fusion | {api_reason}"
+            return f"ML time kept (ML weight outweighs API) | {api_reason}"
+        return f"Balanced fusion (ML time) | {api_reason}"
 
     # ── conflict resolution ───────────────────────────────────────────────────
 
     def _resolve_conflicts(self, schedule: List[Dict]) -> List[Dict]:
-        
-        if len(schedule) <= 1:
-            return schedule
-
-        schedule = sorted(schedule, key=lambda x: x["start_time"])
-        resolved = []
-        current  = schedule[0]
-
-        for nxt in schedule[1:]:
-            if current["end_time"] <= nxt["start_time"]:
-                # No overlap — carry on
-                resolved.append(current)
-                current = nxt
-                continue
-
-            # ── Overlap detected ──────────────────────────────────────────────
-            logger.warning(
-                f"Overlap detected: {current['task']} and {nxt['task']}"
-            )
-
-            # Preserve the original durations BEFORE we move anything
-            current_dur = current["end_time"] - current["start_time"]
-            nxt_dur     = nxt["end_time"]     - nxt["start_time"]
-
-            if nxt["final_score"] > current["final_score"]:
-                # Next task has higher score — shift CURRENT to end before next
-                logger.info(f"Resolving: {nxt['task']} wins (higher score)")
-                # Current task is pushed to start before next task
-                # (it keeps its duration but is squeezed earlier if possible)
-                resolved.append(current)
-                # Shift next task to start right after current
-                new_start          = current["end_time"]
-                nxt["start_time"]  = new_start
-                nxt["end_time"]    = new_start + nxt_dur
-                current            = nxt
-            else:
-                # Current task wins — push next task to start after current ends
-                logger.info(f"Resolving: {current['task']} wins (higher score)")
-                new_start          = current["end_time"]
-                nxt["start_time"]  = new_start
-                nxt["end_time"]    = new_start + nxt_dur
-                resolved.append(current)
-                current = nxt
-
-        resolved.append(current)
-        return resolved
+        """
+        Higher final_score places first and keeps its slot. A lower-score task
+        that overlaps is moved to the first free time after it (duration kept).
+        """
+        placed = []
+        for t in sorted(schedule, key=lambda x: -x["final_score"]):
+            dur, start = t["end_time"] - t["start_time"], t["start_time"]
+            moved = True
+            while moved:
+                moved = False
+                for p in placed:
+                    if start < p["end_time"] and p["start_time"] < start + dur:
+                        start, moved = p["end_time"], True
+            if start != t["start_time"]:
+                logger.info(f"Overlap: {t['task']} moved "
+                            f"{t['start_time']:%H:%M} → {start:%H:%M} (lower score)")
+            t["start_time"], t["end_time"] = start, start + dur
+            t["past_day_end"] = t["end_time"].hour >= 23 or t["end_time"].date() > t["start_time"].date()
+            placed.append(t)
+        return sorted(placed, key=lambda x: x["start_time"])
 
 
 # ── quick self-test ───────────────────────────────────────────────────────────
@@ -288,14 +283,14 @@ class ScheduleFusionEngine:
 def _test_fusion_engine():
     ml_schedule = [
         {
-            "task":       "Breakfast",
+            "task":       "Eating",
             "start_time": datetime.now().replace(hour=8,  minute=30, second=0, microsecond=0),
             "end_time":   datetime.now().replace(hour=9,  minute=0,  second=0, microsecond=0),
             "ml_score": 0.85, "rl_reward": 0.9, "habit_alignment": 0.8,
             "deadline_satisfaction": 1.0, "priority_score": 0.75,
         },
         {
-            "task":       "Exercise",
+            "task":       "Exercising",
             "start_time": datetime.now().replace(hour=14, minute=0,  second=0, microsecond=0),
             "end_time":   datetime.now().replace(hour=15, minute=0,  second=0, microsecond=0),
             "ml_score": 0.75, "rl_reward": 0.7, "habit_alignment": 0.8,
@@ -305,21 +300,35 @@ def _test_fusion_engine():
 
     api_schedule = [
         {
-            "task":       "Breakfast",
+            "task":       "Eating",
             "start_time": datetime.now().replace(hour=7, minute=30, second=0, microsecond=0),
             "end_time":   datetime.now().replace(hour=8, minute=0,  second=0, microsecond=0),
-            "score": 0.95, "reason": "✓ Ideal time for Breakfast",
+            "score": 0.95, "reason": "✓ Ideal time for Eating",
         },
         {
-            "task":       "Exercise",
+            "task":       "Exercising",
             "start_time": datetime.now().replace(hour=7, minute=0,  second=0, microsecond=0),
             "end_time":   datetime.now().replace(hour=8, minute=0,  second=0, microsecond=0),
-            "score": 1.0,  "reason": "✓ Ideal time for Exercise",
+            "score": 1.0,  "reason": "✓ Ideal time for Exercising",
         },
     ]
 
+    import copy
+
+    def overlaps(s):
+        return sum(1 for i, a in enumerate(s) for b in s[i + 1:]
+                   if a["start_time"] < b["end_time"] and b["start_time"] < a["end_time"])
+
+    # Plan check (CLAUDE.md A6): no overlaps; weight 1/0 → all ML; weight 0/1 → all API
+    for w_ml, w_api in [(1.0, 0.0), (0.0, 1.0)]:
+        f = ScheduleFusionEngine(w_ml, w_api, adaptive=False).combine_schedules(
+            copy.deepcopy(ml_schedule), copy.deepcopy(api_schedule))
+        print(f"weights ML={w_ml} API={w_api}: sources={[t['source'] for t in f]}, overlaps={overlaps(f)}")
+
     engine = ScheduleFusionEngine(model_weight=0.7, api_weight=0.3)
-    fused  = engine.combine_schedules(ml_schedule, api_schedule, habit_confidence=0.6)
+    fused  = engine.combine_schedules(copy.deepcopy(ml_schedule), copy.deepcopy(api_schedule),
+                                      habit_confidence=0.6)
+    print(f"default engine: overlaps={overlaps(fused)}")
 
     print("\n" + "=" * 70)
     print("FUSION ENGINE TEST")

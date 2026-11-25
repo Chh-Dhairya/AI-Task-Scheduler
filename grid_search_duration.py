@@ -31,7 +31,8 @@ def verify_gpu():
 device = verify_gpu()
 
 # ── 1. Load & preprocess ──────────────────────────────────────────────────────
-df = load_dataset("C:\\Users\\user\\OneDrive\\Desktop\\activities_of_daily_living_fixed.csv")
+DATA_PATH = "activities_of_daily_living_fixed.csv"
+df = load_dataset(DATA_PATH)
 df["DayOfWeek"] = df["Start"].dt.dayofweek
 
 preprocessor = DataPreprocessor()
